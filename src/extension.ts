@@ -8,6 +8,7 @@ import type { LanguageFn } from 'highlight.js';
 
 import { getDataPath, getHljsLanguages, getHljsPath } from './lib/common/constants.js';
 import { DbusService } from './lib/common/dbus.js';
+import { measure, startFrameMonitor, startStallMonitor, stopStallMonitor, timer } from './lib/common/perf.js';
 import { ClipboardHistory, CopyousSettings, migrateSettings } from './lib/common/settings.js';
 import { SoundManager, tryCreateSoundManager } from './lib/common/sound.js';
 import { ClipboardEntry } from './lib/database/database.js';
@@ -20,6 +21,8 @@ import { ThemeManager } from './lib/misc/theme.js';
 import { ClipboardDialog } from './lib/ui/clipboardDialog.js';
 import { ClipboardIndicator } from './lib/ui/indicator.js';
 
+const HLJS_INIT_DELAY_S = 3;
+
 export default class CopyousExtension extends Extension {
 	public settings!: CopyousSettings;
 	public logger!: ConsoleLike;
@@ -30,6 +33,8 @@ export default class CopyousExtension extends Extension {
 	private hljsMonitor: Gio.FileMonitor | undefined;
 	private hljsLanguages: Map<string, boolean> | undefined;
 	private hljsCallbacks: (() => void)[] | undefined;
+	private hljsInitId: number = 0;
+	private hljsInitPromise: Promise<void> | undefined;
 
 	public themeManager: ThemeManager | undefined;
 
@@ -50,6 +55,9 @@ export default class CopyousExtension extends Extension {
 	public clipboardManager: ClipboardManager | undefined;
 
 	override enable() {
+		startStallMonitor();
+		startFrameMonitor();
+		const enableDone = timer('enable()');
 		this.settings = this.getSettings();
 		migrateSettings(this.settings);
 
@@ -60,7 +68,12 @@ export default class CopyousExtension extends Extension {
 		this.mediaProbe = new MediaProbe(this);
 
 		// Highlight.js
-		this.initHljs().catch(error);
+		// Parsing highlight.js blocks the main loop, so it is loaded after login has settled down
+		this.hljsInitId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, HLJS_INIT_DELAY_S, () => {
+			this.hljsInitId = 0;
+			this.ensureHljs().catch(error);
+			return GLib.SOURCE_REMOVE;
+		});
 
 		// Theme
 		this.themeManager = new ThemeManager(this);
@@ -173,6 +186,20 @@ export default class CopyousExtension extends Extension {
 			},
 			this,
 		);
+		enableDone();
+	}
+
+	/**
+	 * Loads highlight.js if it has not been loaded yet
+	 */
+	public ensureHljs(): Promise<void> {
+		if (this.hljsInitId) {
+			GLib.source_remove(this.hljsInitId);
+			this.hljsInitId = 0;
+		}
+
+		this.hljsInitPromise ??= this.initHljs();
+		return this.hljsInitPromise;
 	}
 
 	private async initHljs() {
@@ -180,7 +207,9 @@ export default class CopyousExtension extends Extension {
 
 		const hljsPath = getHljsPath(this);
 		try {
+			const importDone = timer('hljs import');
 			const hljs = (await import(hljsPath.get_uri())) as { default: HLJSApi };
+			importDone();
 			this.hljs = hljs.default;
 
 			// Disable file monitor
@@ -191,7 +220,9 @@ export default class CopyousExtension extends Extension {
 			await this.loadHljsLanguages();
 
 			// Notify dependents
-			this.hljsCallbacks?.forEach((fn) => fn());
+			measure(`hljs init callbacks (${this.hljsCallbacks?.length ?? 0})`, () =>
+				this.hljsCallbacks?.forEach((fn) => fn()),
+			);
 			this.hljsCallbacks = undefined;
 		} catch {
 			this.hljs = null;
@@ -269,10 +300,12 @@ export default class CopyousExtension extends Extension {
 		if (!this.entryTracker || !this.entryTracker.shouldInit) return;
 
 		this.clipboardDialog?.clearEntries();
+		const dbDone = timer('database init');
 		const entries = await this.entryTracker.init();
-		for (const entry of entries) {
-			this.clipboardDialog?.addEntry(entry);
-		}
+		dbDone();
+		const addDone = timer(`add ${entries.length} entries (time-sliced)`);
+		await this.clipboardDialog?.addEntries(entries);
+		addDone();
 	}
 
 	private async initHistoryTimeout() {
@@ -296,6 +329,8 @@ export default class CopyousExtension extends Extension {
 	}
 
 	override disable() {
+		stopStallMonitor();
+
 		// UI
 		this.clipboardDialog?.disconnectObject(this);
 		this.clipboardDialog?.destroy();
@@ -305,6 +340,9 @@ export default class CopyousExtension extends Extension {
 		this.indicator = undefined;
 
 		// Highlight.js
+		if (this.hljsInitId) GLib.source_remove(this.hljsInitId);
+		this.hljsInitId = 0;
+		this.hljsInitPromise = undefined;
 		this.hljs = undefined;
 		this.hljsMonitor?.disconnectObject(this);
 		this.hljsMonitor?.cancel();

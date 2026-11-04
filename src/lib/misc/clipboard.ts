@@ -20,6 +20,9 @@ Gio._promisify(Gio.File.prototype, 'replace_contents_async');
 Gio._promisify(Gio.MemoryOutputStream.prototype, 'splice_async');
 Gio._promisify(Meta.SelectionSource.prototype, 'read_async');
 
+/** Number of characters used to detect whether copied text is code */
+const CODE_DETECTION_MAX_CHARS = 2000;
+
 const MimeTypes = {
 	Text: ['text/plain;charset=utf-8', 'UTF8_STRING', 'text/plain', 'STRING'],
 	Image: ['image/png', 'image/jxl', 'image/webp', 'image/avif', 'image/jpeg'],
@@ -406,7 +409,9 @@ export class ClipboardManager extends GObject.Object {
 			}
 
 			// Code
-			const slice = trimmed.slice(0, 10000);
+			// Language detection runs every grammar over the text on the main loop, so only a prefix is used
+			await this.ext.ensureHljs().catch(() => {});
+			const slice = trimmed.slice(0, CODE_DETECTION_MAX_CHARS);
 			const n = Math.max(1, slice.length / 100);
 			const highlightResult = this.ext.hljs?.highlightAuto(slice);
 			if (highlightResult && highlightResult.language && highlightResult.relevance / n >= 3) {

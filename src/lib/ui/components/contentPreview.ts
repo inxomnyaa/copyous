@@ -450,7 +450,7 @@ export async function tryCreateFilePreview(
 				return allowedTypes & FilePreviewType.Image ? new ImagePreview(ext, file) : null;
 		}
 
-		return thumbnail && allowedTypes & FilePreviewType.Thumbnail ? new ThumbnailPreview(ext, file) : null;
+		return thumbnail && allowedTypes & FilePreviewType.Thumbnail ? new ThumbnailPreview(ext, thumbnail) : null;
 	} catch (error) {
 		if (!cancellable?.is_cancelled()) ext.logger.error(error);
 		return null;

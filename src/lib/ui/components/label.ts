@@ -7,6 +7,30 @@ interface ConstructorProps {
 	tabWidth: number;
 }
 
+const PREVIEW_MAX_LINES = 100;
+const PREVIEW_MAX_CHARS = 5000;
+
+/**
+ * Cut text down to what can possibly be visible in a clipboard item. Laying out (and highlighting)
+ * text that is clipped away anyway is expensive for large clipboard entries.
+ * @param text The text to truncate
+ */
+export function truncateForPreview(text: string): string {
+	// Skip leading blank lines so that they do not count towards the limit
+	const start = text.search(/\S/);
+	if (start > 0) text = text.slice(text.lastIndexOf('\n', start) + 1);
+
+	if (text.length > PREVIEW_MAX_CHARS) text = text.slice(0, PREVIEW_MAX_CHARS);
+
+	let index = -1;
+	for (let i = 0; i < PREVIEW_MAX_LINES; i++) {
+		index = text.indexOf('\n', index + 1);
+		if (index === -1) return text;
+	}
+
+	return text.slice(0, index);
+}
+
 /**
  * Remove leading/trailing blank lines (empty lines or lines containing just spaces/tabs)
  * @param text The text to trim
@@ -81,6 +105,6 @@ export class Label extends St.Label {
 	}
 
 	private updateLabel() {
-		this.text = normalizeIndentation(trim(this.label), this.tabWidth);
+		this.text = normalizeIndentation(trim(truncateForPreview(this.label)), this.tabWidth);
 	}
 }

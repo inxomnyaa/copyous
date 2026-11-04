@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 import Graphene from 'gi://Graphene';
@@ -17,6 +18,7 @@ import type CopyousExtension from '../../extension.js';
 import { ItemType } from '../common/constants.js';
 import { registerClass } from '../common/gjs.js';
 import { Icon, loadIcon } from '../common/icons.js';
+import { measure, perfEnabled, timer } from '../common/perf.js';
 import { OpenClipboardDialogBehavior } from '../common/settings.js';
 import { ClipboardEntry } from '../database/database.js';
 import { VERSION } from '../misc/compatibility.js';
@@ -36,6 +38,9 @@ import { CenterBox, CollapsibleHeaderLayout, FitConstraint } from './layout.js';
 import { SearchEntry, SearchQuery } from './searchEntry.js';
 
 const ANIMATION_TIME = 150;
+
+/** Maximum time spent creating clipboard items per main loop iteration */
+const ENTRY_BATCH_BUDGET_US = 8000;
 
 @registerClass()
 class IncognitoButton extends St.Button {
@@ -402,6 +407,10 @@ export class ClipboardDialog extends Clutter.Actor {
 	}
 
 	override destroy() {
+		if (this._pendingEntriesId) GLib.source_remove(this._pendingEntriesId);
+		this._pendingEntriesId = 0;
+		this._pendingEntries = [];
+		this.resolvePendingEntries();
 		(Main.inputMethod as Clutter.InputMethod).disconnectObject(this);
 		this._ibusManager.disconnectObject(this);
 		this.ext.settings.disconnectObject(this);
@@ -425,6 +434,14 @@ export class ClipboardDialog extends Clutter.Actor {
 
 	public open() {
 		if (this.opened || this._closing) return;
+
+		if (perfEnabled()) {
+			const openDone = timer('dialog open -> first frame');
+			const paintId = global.stage.connect('after-paint', () => {
+				global.stage.disconnect(paintId);
+				openDone();
+			});
+		}
 
 		this._updateCursor = false;
 		this._nextCursor = this._cursor;
@@ -542,10 +559,48 @@ export class ClipboardDialog extends Clutter.Actor {
 		});
 	}
 
+	private _pendingEntries: ClipboardEntry[] = [];
+	private _pendingEntriesId: number = 0;
+	private _pendingEntriesWaiters: (() => void)[] = [];
+
+	/**
+	 * Adds entries in small batches so that the main loop (and with it the whole desktop) is not blocked
+	 * while the history is loaded.
+	 * @param entries The entries to add
+	 * @returns A promise that resolves once all pending entries have been added
+	 */
+	public addEntries(entries: ClipboardEntry[]): Promise<void> {
+		this._pendingEntries.push(...entries);
+		const promise = new Promise<void>((resolve) => {
+			this._pendingEntriesWaiters.push(resolve);
+		});
+
+		this._pendingEntriesId ||= GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+			const start = GLib.get_monotonic_time();
+			while (this._pendingEntries.length > 0 && GLib.get_monotonic_time() - start < ENTRY_BATCH_BUDGET_US) {
+				this.addEntry(this._pendingEntries.shift()!);
+			}
+
+			if (this._pendingEntries.length > 0) return GLib.SOURCE_CONTINUE;
+
+			this._pendingEntriesId = 0;
+			this.resolvePendingEntries();
+			return GLib.SOURCE_REMOVE;
+		});
+
+		return promise;
+	}
+
+	private resolvePendingEntries() {
+		const waiters = this._pendingEntriesWaiters;
+		this._pendingEntriesWaiters = [];
+		waiters.forEach((resolve) => resolve());
+	}
+
 	public addEntry(entry: ClipboardEntry): void {
 		let item;
 		try {
-			item = (() => {
+			item = measure(`create ${entry.type} item #${entry.id}`, () => {
 				switch (entry.type) {
 					case ItemType.Text:
 						return new TextItem(this.ext, entry);
@@ -566,7 +621,7 @@ export class ClipboardDialog extends Clutter.Actor {
 					default:
 						return null;
 				}
-			})();
+			});
 
 			if (!item) {
 				this.ext.logger.error('Unknown item type', entry);
@@ -645,6 +700,7 @@ export class ClipboardDialog extends Clutter.Actor {
 	}
 
 	public clearEntries() {
+		this._pendingEntries = [];
 		this._scrollView.clearItems();
 	}
 
